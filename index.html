@@ -87,13 +87,9 @@ button:focus-visible,select:focus-visible{outline:2px solid var(--in);outline-of
 .ledger .sub{margin:0 0 14px;font-size:12.5px;color:var(--ink-soft)}
 .side-in h4{color:var(--in)}
 .side-out h4{color:var(--out)}
-.total{font-size:24px;font-weight:600;margin:0 0 4px}
-.total span{display:block;line-height:1.35}
-.total span+span{font-size:18px;opacity:.85}
+.total{font-size:24px;font-weight:600;margin:0 0 16px}
 .side-in .total{color:var(--in)}
 .side-out .total{color:var(--out)}
-.usd{margin:0 0 4px;font-size:12.5px;color:var(--ink-soft);font-weight:400}
-.usd:last-of-type{margin-bottom:16px}
 .entry{padding:11px 0;border-top:1px solid var(--rule)}
 .entry .amt{font-size:16px;font-weight:600}
 .entry .who{display:block;margin-top:3px;font-size:12px;word-break:break-all;color:var(--ink-soft)}
@@ -171,12 +167,8 @@ pre{background:var(--paper-hi);border:1px solid var(--rule);padding:12px;overflo
 const UNIT    = "https://api.hyperunit.xyz";
 const MEMPOOL = "https://mempool.space/api";
 const HLINFO  = "https://api.hyperliquid.xyz/info";
-// 公開RPCは CORS 可否・レート制限がまちまちなので、順に試して最初に通ったものを使う
-const SOL_RPCS = ["https://solana-rpc.publicnode.com",
-                  "https://api.mainnet-beta.solana.com"];
-const ETH_RPCS = ["https://ethereum-rpc.publicnode.com",
-                  "https://cloudflare-eth.com",
-                  "https://eth.llamarpc.com"];
+const SOL_RPC = "https://api.mainnet-beta.solana.com";
+const ETH_RPC = "https://cloudflare-eth.com";
 
 const $ = (s) => document.querySelector(s);
 const out = $("#out");
@@ -259,7 +251,7 @@ const TYPE_JA = {
 function classifyLedger(events, self){
   const me = String(self||"").toLowerCase();
   const tally = {};
-  const ext={in:[],out:[]}, peer={in:[],out:[]}, other={in:[],out:[]}, unknown={in:[],out:[]};
+  const ext={in:[],out:[]}, peer={in:[],out:[]}, other={in:[],out:[]};
 
   for(const e of (events||[])){
     const d = (e && e.delta) || {};
@@ -270,15 +262,11 @@ function classifyLedger(events, self){
     const dest = String(d.destination||"").toLowerCase();
     const from = String(d.user||"").toLowerCase();
 
-    // usd は「概算のドル額」。通貨をまたいで足せるのはこれだけで、
-    // value は通貨ごとにしか足してはいけない。
-    const usdEq = Math.abs(Number(d.usdcValue != null ? d.usdcValue : usdc)) || 0;
-
     if(t === "deposit"){
-      ext.in.push({value:Math.abs(usdc), unit:"USDC", usd:Math.abs(usdc), time, dir:"in",
+      ext.in.push({value:Math.abs(usdc), unit:"USDC", time, dir:"in",
                    chain:"ethereum", who:"外部チェーンのブリッジ"});
     }else if(t === "withdraw"){
-      ext.out.push({value:Math.abs(usdc), unit:"USDC", usd:Math.abs(usdc), time, dir:"out",
+      ext.out.push({value:Math.abs(usdc), unit:"USDC", time, dir:"out",
                     chain:"ethereum", who:"外部チェーンへ"});
     }else if(PEER_TYPES.has(t)){
       const incoming = dest===me ? true : (from===me ? false : usdc>0);
@@ -286,59 +274,28 @@ function classifyLedger(events, self){
       const isSpot   = (t==="spotTransfer" || t==="send");
       const value    = isSpot ? Math.abs(Number(d.amount != null ? d.amount : usdc)) : Math.abs(usdc);
       const unit     = isSpot ? String(d.token||"token") : "USDC";
-      if(value===0 && usdEq===0) continue;   // 金額ゼロは出所の手がかりにならない
-      const rec = {value, unit, usd:usdEq, time,
-                   dir: incoming?"in":"out", chain:"hyperliquid", who:counter};
-      // 相手として取り出したアドレスが自分自身なら、フィールドの意味を取り違えている。
-      // 推測で埋めず、別枠に隔離して生データで確認できるようにする。
-      const selfRef = String(counter).toLowerCase() === me;
-      (selfRef ? (incoming?unknown.in:unknown.out) : (incoming?peer.in:peer.out)).push(rec);
+      (incoming?peer.in:peer.out).push({value, unit, time,
+        dir: incoming?"in":"out", chain:"hyperliquid", who:counter});
     }else if(!SELF_TYPES.has(t)){
       const incoming = usdc > 0;
-      if(Math.abs(usdc)===0 && usdEq===0) continue;
-      (incoming?other.in:other.out).push({value:Math.abs(usdc), unit:"USDC", usd:usdEq, time,
+      (incoming?other.in:other.out).push({value:Math.abs(usdc), unit:"USDC", time,
         dir: incoming?"in":"out", chain:"hyperliquid", who: TYPE_JA[t] || t});
     }
   }
   const byTimeDesc = (a)=>a.sort((x,y)=>String(y.time).localeCompare(String(x.time)));
-  [ext.in,ext.out,peer.in,peer.out,other.in,other.out,unknown.in,unknown.out].forEach(byTimeDesc);
-  return {ext, peer, other, unknown, tally};
+  [ext.in,ext.out,peer.in,peer.out,other.in,other.out].forEach(byTimeDesc);
+  return {ext, peer, other, tally};
 }
 
 /* ── 描画 ─────────────────────────────────────────── */
 const verdict = (cls,title,body) =>
   '<div class="verdict '+cls+'"><h2>'+esc(title)+'</h2><p>'+body+'</p></div>';
 
-/* 通貨ごとに合計する。value を通貨またぎで足すのは誤りなので必ずこれを通す。 */
-function sumByUnit(rows){
-  const m = new Map();
-  for(const r of rows){
-    const u = r.unit || "?";
-    const e = m.get(u) || {value:0, usd:0, count:0};
-    e.value += Number(r.value)||0;
-    e.usd   += Number(r.usd)||0;
-    e.count += 1;
-    m.set(u, e);
-  }
-  return [...m.entries()].sort((a,b)=>(b[1].usd-a[1].usd)||(b[1].value-a[1].value));
-}
-const sumUSD  = rows => rows.reduce((s,r)=>s+(Number(r.usd)||0),0);
-const sumUnit = (rows,u) => rows.filter(r=>r.unit===u).reduce((s,r)=>s+(Number(r.value)||0),0);
-
-function totalsHTML(rows){
-  if(!rows.length) return '<p class="total mono">\u2014</p>';
-  const list = sumByUnit(rows);
-  const usd  = sumUSD(rows);
-  const head = list.slice(0,4).map(e =>
-    '<span>'+fmt(e[1].value, e[0]==="USDC"?2:6)+' '+esc(e[0])+'</span>').join("");
-  return '<div class="total mono">'+head+'</div>'
-    + (list.length>4 ? '<p class="usd">ほか '+(list.length-4)+' 通貨</p>' : '')
-    + (usd>0 ? '<p class="usd mono">概算 '+fmt(usd,0)+' USDC 相当</p>' : '');
-}
-
 const MAX_ROWS = 12;
 function ledger(title, subtitle, ins, outs, subIn, subOut){
   if(!ins.length && !outs.length) return "";
+  const sum = rows => rows.reduce((s,r)=>s+(Number(r.value)||0),0);
+  const unitOf = rows => rows.length && rows.every(r=>r.unit===rows[0].unit) ? rows[0].unit : "";
   const row = r => '<div class="entry"><span class="amt mono">'
       + fmt(r.value, r.unit==="USDC" ? 2 : 8) + ' ' + esc(r.unit||"")
       + '</span><span class="when mono"> ' + esc(day(r.time))
@@ -346,7 +303,7 @@ function ledger(title, subtitle, ins, outs, subIn, subOut){
       + link(r.chain, r.who) + '</span></div>';
   const side = (cls,h,sub,rows) => '<section class="'+cls+'"><h4>'+esc(h)+'</h4>'
       + '<p class="sub">'+esc(sub)+'</p>'
-      + totalsHTML(rows)
+      + '<p class="total mono">' + (rows.length ? fmt(sum(rows),2)+" "+esc(unitOf(rows)) : "\u2014") + '</p>'
       + (rows.length ? rows.slice(0,MAX_ROWS).map(row).join("") : '<p class="empty">記録がありません。</p>')
       + (rows.length>MAX_ROWS ? '<p class="more">ほか '+(rows.length-MAX_ROWS)+' 件（合計には入っています）</p>' : '')
       + '</section>';
@@ -355,50 +312,6 @@ function ledger(title, subtitle, ins, outs, subIn, subOut){
     + side("side-in","入ってきた",subIn,ins)
     + side("side-out","出ていった",subOut,outs)
     + '</div></div>';
-}
-
-/* 相手別に合計する。件数が多いとき、明細を眺めるより誰がいくら送ったかを見るほうが早い。 */
-function counterpartyTable(ins, outs){
-  const m = new Map();
-  const add = (r, dir) => {
-    const k = String(r.who||"?")+"|"+String(r.unit||"?")+"|"+dir;
-    const e = m.get(k) || {who:r.who, unit:r.unit, dir, count:0, value:0, usd:0,
-                           first:r.time||"", last:r.time||""};
-    e.count++; e.value += Number(r.value)||0; e.usd += Number(r.usd)||0;
-    if(r.time){ if(!e.first || r.time<e.first) e.first=r.time;
-                if(!e.last  || r.time>e.last ) e.last =r.time; }
-    m.set(k,e);
-  };
-  ins.forEach(r=>add(r,"in"));
-  outs.forEach(r=>add(r,"out"));
-  if(!m.size) return "";
-  const all = [...m.values()].sort((a,b)=>(b.usd-a.usd)||(b.value-a.value));
-  const list = all.slice(0,25);
-  const rows = list.map(e =>
-    '<tr><td>'+(e.dir==="in" ? "\u2190 入" : "\u2192 出")+'</td>'
-    + '<td class="addr">'+link("hyperliquid", e.who)+'</td>'
-    + '<td class="num">'+fmt(e.value, e.unit==="USDC"?2:6)+'</td>'
-    + '<td>'+esc(e.unit||"")+'</td>'
-    + '<td class="num">'+(e.usd>0 ? fmt(e.usd,0) : "\u2014")+'</td>'
-    + '<td class="num">'+e.count+'</td>'
-    + '<td class="addr">'+esc(day(e.first))+' \u2192 '+esc(day(e.last))+'</td></tr>').join("");
-  return '<div class="block"><h3>相手別の集計</h3>'
-    + '<p class="sub">同じ相手・同じ通貨をまとめました。概算ドル額の大きい順です。'
-    + '出所をたどるなら、上から順にこのアドレスを調べてください。</p>'
-    + '<table><thead><tr><th>向き</th><th>相手</th><th>合計</th><th>通貨</th>'
-    + '<th>概算USDC</th><th>件数</th><th>期間</th></tr></thead><tbody>'+rows+'</tbody></table>'
-    + (all.length>list.length ? '<p class="sub" style="margin-top:10px">ほか '+(all.length-list.length)+' 組</p>' : '')
-    + '</div>';
-}
-
-/* 台帳の生データ。フィールドの意味を推測で決めないための確認用。 */
-function rawBlock(events, n){
-  if(!Array.isArray(events) || !events.length) return "";
-  const head = events.slice(0, n||20);
-  return '<details><summary>台帳の生データを見る（先頭 '+head.length+' 件 / 全 '+events.length+' 件）</summary>'
-    + '<p class="sub" style="margin:10px 0 6px">相手の判別がおかしいときは、ここの user / destination が'
-    + '実際に何を指しているかを確かめてください。</p>'
-    + '<pre>'+esc(JSON.stringify(head, null, 1))+'</pre></details>';
 }
 
 function tallyTable(tally){
@@ -440,25 +353,18 @@ async function probeBTC(a){
     received:(cs.funded_txo_sum||0)/1e8, sent:(cs.spent_txo_sum||0)/1e8,
     balance:((cs.funded_txo_sum||0)-(cs.spent_txo_sum||0))/1e8};
 }
-async function rpc(urls, body, tag){
-  for(const u of urls){
-    const r = await postJSON(u, body, tag+" @"+u.replace(/^https:\/\//,""));
-    if(r && ("result" in r)) return r;
-  }
-  return null;
-}
 async function probeSOL(a){
-  const r = await rpc(SOL_RPCS,
+  const r = await postJSON(SOL_RPC,
     {jsonrpc:"2.0",id:1,method:"getSignaturesForAddress",params:[a,{limit:1}]},
     "solana "+short(a));
-  if(!r) return {known:false};
+  if(!r || !("result" in r)) return {known:false};
   return {known:true, used:Array.isArray(r.result) && r.result.length>0};
 }
 async function probeETH(a){
-  const b = await rpc(ETH_RPCS,
+  const b = await postJSON(ETH_RPC,
     {jsonrpc:"2.0",id:1,method:"eth_getBalance",params:[a,"latest"]}, "eth balance "+short(a));
-  if(!b) return {known:false};
-  const n = await rpc(ETH_RPCS,
+  if(!b || !("result" in b)) return {known:false};
+  const n = await postJSON(ETH_RPC,
     {jsonrpc:"2.0",id:2,method:"eth_getTransactionCount",params:[a,"latest"]}, "eth nonce "+short(a));
   return {known:true, balance:parseInt(b.result,16)/1e18,
           nonce: (n && n.result) ? parseInt(n.result,16) : 0};
@@ -573,11 +479,8 @@ async function renderEVM(a){
     {type:"userNonFundingLedgerUpdates", user:a, startTime:since}, "hyperliquid ledger");
   const c = classifyLedger(Array.isArray(led)?led:[], a);
 
-  // 通貨をまたいだ合計は意味を持たない。USDC 同士で比べ、他通貨は概算ドルで別に示す。
-  const peerInUsdc = sumUnit(c.peer.in, "USDC");
-  const extInUsdc  = sumUnit(c.ext.in,  "USDC");
-  const peerInUsd  = sumUSD(c.peer.in);
-  const peerOtherUnits = sumByUnit(c.peer.in).filter(e=>e[0]!=="USDC").length;
+  const peerIn = c.peer.in.reduce((s,r)=>s+r.value,0);
+  const extIn  = c.ext.in.reduce((s,r)=>s+r.value,0);
 
   let v;
   if(uIn.length || uOut.length){
@@ -586,12 +489,10 @@ async function renderEVM(a){
   }else if(anyVesselUsed){
     v = verdict("bad","Unit の記録は空だが、受け皿は使われています",
       "記録が空でも受け皿アドレスに取引があります。API が古い記録を持っていないと考えられるので、そのアドレスを explorer で直接たどってください。");
-  }else if(c.peer.in.length && (peerInUsdc > extInUsdc || peerInUsd > extInUsdc)){
+  }else if(c.peer.in.length && peerIn > extIn){
     v = verdict("ok","主な入金は Hyperliquid 内の他アカウントからです",
-      "外部チェーンからの USDC は "+fmt(extInUsdc,0)+" ですが、Hyperliquid 上の他アカウントからは "
-      + fmt(peerInUsdc,0)+" USDC"
-      + (peerOtherUnits ? "（ほかに "+peerOtherUnits+" 種類のトークン、概算あわせて "+fmt(peerInUsd,0)+" USDC 相当）" : "")
-      + " 入っています。出所をたどるには、下の「相手別の集計」を上から調べてください。");
+      "外部チェーンからは "+fmt(extIn,0)+" USDC ですが、Hyperliquid 上の他アカウントから "
+      +fmt(peerIn,0)+" USDC 入っています。出所をたどるには、下の相手アドレスを1つずつ調べてください。");
   }else if(c.ext.in.length || c.ext.out.length){
     v = verdict("none","BTC・SOL 経路は使われていません",
       "受け皿はすべて未使用でした。この口座の資金は外部チェーンからの USDC です。");
@@ -609,17 +510,11 @@ async function renderEVM(a){
              c.peer.in, c.peer.out, "送ってきたアカウント", "送った先のアカウント")
     + ledger("その他の増減（Vault・強制決済・報酬など）","出所ではありませんが、残高が動いた理由として記録しています。",
              c.other.in, c.other.out, "増えた要因", "減った要因")
-    + ledger("相手が特定できない送金","送金相手として取り出したアドレスが、調べている本人と同じになったものです。台帳のフィールドの読み取りが正しくない可能性が高いので、出所の集計からは外しています。生データで中身を確かめてください。",
-             c.unknown.in, c.unknown.out, "入ってきた扱いのもの", "出ていった扱いのもの")
-    + counterpartyTable(c.peer.in, c.peer.out)
     + vessels(rows)
     + tallyTable(c.tally)
-    + rawBlock(Array.isArray(led)?led:[], 20)
     + notes([
         "受け皿アドレスは Unit が管理するもので、本人のアドレスではありません。<strong>ここへ送ってきた相手</strong>が本当の出所です。",
         "<strong>Hyperliquid 内の他アカウントからの送金は、他人からの入金でありえます。</strong>相手アドレスを1つずつ調べてください。",
-        "<strong>合計は通貨ごとに出しています。</strong>USDC と HYPE と USDE を足した数字には意味がないためです。「概算 USDC 相当」は Hyperliquid が記録している評価額で、参考値です。",
-        "<strong>「相手が特定できない送金」に金額が出ている場合、その分は上の合計に入っていません。</strong>台帳のフィールドの読み取りが未確定なためで、実際の出所である可能性があります。生データで確認してください。",
         "除外しているのは自分の口座内の振替だけです。内訳表で全件確認できます。",
         "Binance などの取引所に行き着いたら、そこで追跡は終わりです。その先はチェーンの外なので、推測でつながないでください。",
         "受け皿が未使用でも、Ethereum は ERC-20 の受領までは見ていません。Etherscan の Token Transfers タブも確認してください。"
